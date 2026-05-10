@@ -124,6 +124,13 @@ const PROGRAMS = {
   dropTile: new PublicKey("ENLdCrebMYYvRQFaMCNJAn3DCzEZSJ8JXpwVBFX9R7NH"),
 };
 
+const DELEGATION_PROGRAM_ID = new PublicKey(
+  "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh"
+);
+const EPHEMERAL_ROLLUP_VALIDATOR = new PublicKey(
+  "mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev"
+);
+
 const PLAYER_SESSION_SIZE = 118;
 const PLAYER_SESSION_DELEGATE_OFFSET = 72;
 const PLAYER_SESSION_DISCRIMINATOR = Buffer.from([
@@ -503,10 +510,18 @@ const getManifestTileItem = (runtime: Runtime, point: GridPoint) =>
     (item) => item.x === point.x && item.y === point.y
   );
 
-const getTileItemRefs = async (runtime: Runtime, player: PlayerRefs, point: GridPoint) => {
+const getTileItemRefs = async (
+  runtime: Runtime,
+  player: PlayerRefs,
+  point: GridPoint
+) => {
   const manifestItem = getManifestTileItem(runtime, point);
   if (manifestItem) {
-    return { entity: new PublicKey(manifestItem.entityPda) };
+    return {
+      entity: new PublicKey(manifestItem.entityPda),
+      component: new PublicKey(manifestItem.componentPda),
+      fromManifest: true,
+    };
   }
 
   const entity = await deriveEntity(
@@ -514,7 +529,131 @@ const getTileItemRefs = async (runtime: Runtime, player: PlayerRefs, point: Grid
     player.worldPda,
     deriveTileItemEntity(point)
   );
-  return { entity };
+  const component = await deriveComponent(runtime, entity, PROGRAMS.tileItem);
+  return { entity, component, fromManifest: false };
+};
+
+const findDelegationRecordPda = (delegatedAccount: PublicKey) =>
+  PublicKey.findProgramAddressSync(
+    [Buffer.from("delegation"), delegatedAccount.toBytes()],
+    DELEGATION_PROGRAM_ID
+  )[0];
+
+const isComponentVisibleOnEr = async (runtime: Runtime, component: PublicKey) =>
+  Boolean(await runtime.erConnection.getAccountInfo(component));
+
+const isComponentDelegated = async (runtime: Runtime, component: PublicKey) =>
+  Boolean(
+    await runtime.baseConnection.getAccountInfo(findDelegationRecordPda(component))
+  );
+
+const waitForComponentOnEr = async (
+  runtime: Runtime,
+  component: PublicKey,
+  label: string
+) => {
+  const startedAt = Date.now();
+  const timeoutMs = 15_000;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    if (await isComponentVisibleOnEr(runtime, component)) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  throw new Error(
+    `${label} delegation did not appear on ER at ${runtime.config.erRpcUrl}.`
+  );
+};
+
+const ensureTileItemInitialized = async (
+  runtime: Runtime,
+  tileItem: Awaited<ReturnType<typeof getTileItemRefs>>,
+  point: GridPoint,
+  createIfMissing: boolean
+) => {
+  const [entityInfo, baseComponentInfo, erComponentInfo] = await Promise.all([
+    runtime.baseConnection.getAccountInfo(tileItem.entity),
+    runtime.baseConnection.getAccountInfo(tileItem.component),
+    runtime.erConnection.getAccountInfo(tileItem.component),
+  ]);
+
+  if (!entityInfo && !tileItem.fromManifest && createIfMissing) {
+    const { AddEntity } = await import("@magicblock-labs/bolt-sdk");
+    await sendBoltResult(
+      runtime,
+      (await AddEntity({
+        payer: runtime.agent.publicKey,
+        world: new PublicKey(runtime.manifest.worldPda),
+        seed: deriveTileItemEntity(point),
+        connection: runtime.baseConnection,
+      })) as BoltResult,
+      runtime.baseConnection
+    );
+  }
+
+  if (!baseComponentInfo && !erComponentInfo) {
+    if (!createIfMissing) {
+      throw new Error(
+        `No active tile item component ${tileItem.component.toBase58()} exists for that tile.`
+      );
+    }
+    const { InitializeComponent } = await import("@magicblock-labs/bolt-sdk");
+    await sendBoltResult(
+      runtime,
+      (await InitializeComponent({
+        payer: runtime.agent.publicKey,
+        entity: tileItem.entity,
+        componentId: PROGRAMS.tileItem,
+      })) as BoltResult,
+      runtime.baseConnection
+    );
+  }
+};
+
+const ensureTileItemDelegated = async (
+  runtime: Runtime,
+  tileItem: Awaited<ReturnType<typeof getTileItemRefs>>
+) => {
+  if (await isComponentVisibleOnEr(runtime, tileItem.component)) {
+    return;
+  }
+
+  if (await isComponentDelegated(runtime, tileItem.component)) {
+    await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
+    return;
+  }
+
+  const baseAccount = await runtime.baseConnection.getAccountInfo(
+    tileItem.component
+  );
+  if (!baseAccount) {
+    throw new Error(
+      `Cannot delegate missing tile item component ${tileItem.component.toBase58()}.`
+    );
+  }
+
+  const { createDelegateInstruction } = await import("@magicblock-labs/bolt-sdk");
+  await sendBoltResult(
+    runtime,
+    {
+      componentPda: tileItem.component,
+      instruction: createDelegateInstruction(
+        {
+          payer: runtime.agent.publicKey,
+          entity: tileItem.entity,
+          account: tileItem.component,
+          ownerProgram: PROGRAMS.tileItem,
+        },
+        0,
+        EPHEMERAL_ROLLUP_VALIDATOR,
+        PROGRAMS.tileItem
+      ),
+    },
+    runtime.baseConnection
+  );
+  await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
 };
 
 const getPlayerComponents = async (runtime: Runtime, player: PlayerRefs) => ({
@@ -643,7 +782,7 @@ const applySystem = async (
   }
 
   const result = (await ApplySystem({
-    authority: runtime.agent.publicKey,
+    authority: player.session.owner,
     systemId,
     world: player.worldPda,
     entities,
@@ -657,7 +796,11 @@ const applySystem = async (
   return sendBoltResult(runtime, result);
 };
 
-const sendBoltResult = async (runtime: Runtime, result: BoltResult) => {
+const sendBoltResult = async (
+  runtime: Runtime,
+  result: BoltResult,
+  connection: Connection = runtime.erConnection
+) => {
   const transaction =
     result.transaction ??
     (result.instruction ? new Transaction().add(result.instruction) : null);
@@ -666,12 +809,12 @@ const sendBoltResult = async (runtime: Runtime, result: BoltResult) => {
     throw new Error("BOLT did not return a transaction or instruction.");
   }
 
-  const latest = await runtime.erConnection.getLatestBlockhash("confirmed");
+  const latest = await connection.getLatestBlockhash("confirmed");
   transaction.feePayer = runtime.agent.publicKey;
   transaction.recentBlockhash = latest.blockhash;
   transaction.sign(runtime.agent);
 
-  return runtime.erConnection.sendRawTransaction(transaction.serialize(), {
+  return connection.sendRawTransaction(transaction.serialize(), {
     skipPreflight: true,
   });
 };
@@ -773,6 +916,8 @@ const executeInventoryAction = async (
 ) => {
   const player = await requirePlayer(runtime, playerMint);
   const tileItem = await getTileItemRefs(runtime, player, point);
+  await ensureTileItemInitialized(runtime, tileItem, point, action === "drop");
+  await ensureTileItemDelegated(runtime, tileItem);
   const systemId = action === "drop" ? PROGRAMS.dropTile : PROGRAMS.grabTile;
   const args =
     action === "drop"
