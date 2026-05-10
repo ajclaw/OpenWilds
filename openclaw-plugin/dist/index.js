@@ -49,7 +49,9 @@ const toolResponse = (details) => ({
 const expandPath = (path) => path.startsWith("~/") ? resolve(homedir(), path.slice(2)) : resolve(path);
 const runtimeFromApi = async (api) => {
     const config = readPluginConfig(api.pluginConfig);
-    const agent = await loadKeypair(config.agentKeypairPath);
+    const agentKeypairPath = expandPath(config.agentKeypairPath);
+    process.env.ANCHOR_WALLET ??= agentKeypairPath;
+    const agent = await loadKeypair(agentKeypairPath);
     return {
         config,
         agent,
@@ -76,7 +78,7 @@ const readPluginConfig = (config) => {
     return value;
 };
 const loadKeypair = async (path) => {
-    const raw = JSON.parse(await readFile(expandPath(path), "utf8"));
+    const raw = JSON.parse(await readFile(path, "utf8"));
     return Keypair.fromSecretKey(Uint8Array.from(raw));
 };
 const ensureAgentKeypair = async (config, options = {}) => {
@@ -303,6 +305,15 @@ const deriveTileItemEntity = (point) => {
     seed.writeInt32LE(point.y, 28);
     return seed;
 };
+const getManifestTileItem = (runtime, point) => runtime.manifest.tileItems?.find((item) => item.x === point.x && item.y === point.y);
+const getTileItemRefs = async (runtime, player, point) => {
+    const manifestItem = getManifestTileItem(runtime, point);
+    if (manifestItem) {
+        return { entity: new PublicKey(manifestItem.entityPda) };
+    }
+    const entity = await deriveEntity(runtime, player.worldPda, deriveTileItemEntity(point));
+    return { entity };
+};
 const getPlayerComponents = async (runtime, player) => ({
     playerOwner: await deriveComponent(runtime, player.entityPda, PROGRAMS.playerOwner),
     position: await deriveComponent(runtime, player.entityPda, PROGRAMS.position),
@@ -455,7 +466,7 @@ const executeFarmAction = async (runtime, playerMint, action, point, farmTypeId)
 };
 const executeInventoryAction = async (runtime, playerMint, action, point, itemId, quantity) => {
     const player = await requirePlayer(runtime, playerMint);
-    const tileItemEntity = await deriveEntity(runtime, player.worldPda, deriveTileItemEntity(point));
+    const tileItem = await getTileItemRefs(runtime, player, point);
     const systemId = action === "drop" ? PROGRAMS.dropTile : PROGRAMS.grabTile;
     const args = action === "drop"
         ? {
@@ -472,7 +483,7 @@ const executeInventoryAction = async (runtime, playerMint, action, point, itemId
             PROGRAMS.activeAction,
         ]),
         {
-            entity: tileItemEntity,
+            entity: tileItem.entity,
             components: [{ componentId: PROGRAMS.tileItem }],
         },
         playerEntity(player, [PROGRAMS.inventory]),
