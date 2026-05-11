@@ -31,6 +31,13 @@ type BoltResult = {
   componentPda?: PublicKey;
 };
 
+type BoltSessionTokenState = {
+  exists: boolean;
+  validUntilUnixSeconds: number | null;
+  expired: boolean;
+  active: boolean;
+};
+
 type WorldManifest = {
   worldPda: string;
   terrainTypes?: Array<{
@@ -304,6 +311,10 @@ const describeSessions = async (runtime: Runtime) => {
         runtime.agent.publicKey,
         session.owner
       );
+      const tokenState = await getBoltSessionTokenState(
+        runtime,
+        boltSessionToken
+      );
 
       return {
         session: session.publicKey.toBase58(),
@@ -313,7 +324,9 @@ const describeSessions = async (runtime: Runtime) => {
         scopes: session.scopes,
         scopeLabels: scopeLabels(session.scopes),
         boltSessionToken: boltSessionToken.toBase58(),
-        boltSessionActive: Boolean(await getAccount(runtime, boltSessionToken)),
+        boltSessionActive: tokenState.active,
+        boltSessionValidUntilUnixSeconds: tokenState.validUntilUnixSeconds,
+        boltSessionExpired: tokenState.expired,
       };
     })
   );
@@ -719,6 +732,38 @@ const getAccount = async (runtime: Runtime, pubkey: PublicKey) =>
   (await runtime.erConnection.getAccountInfo(pubkey)) ??
   (await runtime.baseConnection.getAccountInfo(pubkey));
 
+const getBoltSessionTokenState = async (
+  runtime: Runtime,
+  boltSessionToken: PublicKey
+): Promise<BoltSessionTokenState> => {
+  const account = await getAccount(runtime, boltSessionToken);
+  if (!account) {
+    return {
+      exists: false,
+      validUntilUnixSeconds: null,
+      expired: false,
+      active: false,
+    };
+  }
+
+  const validUntilUnixSeconds =
+    account.data.byteLength >= 112
+      ? Number(Buffer.from(account.data).readBigInt64LE(104))
+      : null;
+  const nowUnixSeconds = Math.floor(Date.now() / 1000);
+  const expired =
+    validUntilUnixSeconds !== null &&
+    validUntilUnixSeconds > 0 &&
+    validUntilUnixSeconds <= nowUnixSeconds;
+
+  return {
+    exists: true,
+    validUntilUnixSeconds,
+    expired,
+    active: !expired,
+  };
+};
+
 const deriveBoltSessionToken = async (
   sessionSigner: PublicKey,
   authority: PublicKey
@@ -773,16 +818,25 @@ const applySystem = async (
     runtime.agent.publicKey,
     player.session.owner
   );
-  const hasSession = await getAccount(runtime, boltSessionToken);
+  const sessionTokenState = await getBoltSessionTokenState(
+    runtime,
+    boltSessionToken
+  );
 
-  if (!hasSession) {
+  if (!sessionTokenState.exists) {
     throw new Error(
       `Missing BOLT session token ${boltSessionToken.toBase58()} for owner ${player.session.owner.toBase58()}. Run open_wilds_prepare_session and grant it in the game UI.`
     );
   }
 
+  if (sessionTokenState.expired) {
+    throw new Error(
+      `Expired BOLT session token ${boltSessionToken.toBase58()} for owner ${player.session.owner.toBase58()} (validUntilUnixSeconds=${sessionTokenState.validUntilUnixSeconds}). Run open_wilds_prepare_session and grant it in the game UI before live gameplay actions.`
+    );
+  }
+
   const result = (await ApplySystem({
-    authority: player.session.owner,
+    authority: runtime.agent.publicKey,
     systemId,
     world: player.worldPda,
     entities,

@@ -163,6 +163,7 @@ const describeSessions = async (runtime) => {
     const sessions = await listSessions(runtime);
     return Promise.all(sessions.map(async (session) => {
         const boltSessionToken = await deriveBoltSessionToken(runtime.agent.publicKey, session.owner);
+        const tokenState = await getBoltSessionTokenState(runtime, boltSessionToken);
         return {
             session: session.publicKey.toBase58(),
             playerMint: session.playerMint.toBase58(),
@@ -171,7 +172,9 @@ const describeSessions = async (runtime) => {
             scopes: session.scopes,
             scopeLabels: scopeLabels(session.scopes),
             boltSessionToken: boltSessionToken.toBase58(),
-            boltSessionActive: Boolean(await getAccount(runtime, boltSessionToken)),
+            boltSessionActive: tokenState.active,
+            boltSessionValidUntilUnixSeconds: tokenState.validUntilUnixSeconds,
+            boltSessionExpired: tokenState.expired,
         };
     }));
 };
@@ -425,6 +428,30 @@ const readPlayerState = async (runtime, player) => {
 };
 const getAccount = async (runtime, pubkey) => (await runtime.erConnection.getAccountInfo(pubkey)) ??
     (await runtime.baseConnection.getAccountInfo(pubkey));
+const getBoltSessionTokenState = async (runtime, boltSessionToken) => {
+    const account = await getAccount(runtime, boltSessionToken);
+    if (!account) {
+        return {
+            exists: false,
+            validUntilUnixSeconds: null,
+            expired: false,
+            active: false,
+        };
+    }
+    const validUntilUnixSeconds = account.data.byteLength >= 112
+        ? Number(Buffer.from(account.data).readBigInt64LE(104))
+        : null;
+    const nowUnixSeconds = Math.floor(Date.now() / 1000);
+    const expired = validUntilUnixSeconds !== null &&
+        validUntilUnixSeconds > 0 &&
+        validUntilUnixSeconds <= nowUnixSeconds;
+    return {
+        exists: true,
+        validUntilUnixSeconds,
+        expired,
+        active: !expired,
+    };
+};
 const deriveBoltSessionToken = async (sessionSigner, authority) => {
     const { FindSessionTokenPda } = await import("@magicblock-labs/bolt-sdk");
     return FindSessionTokenPda({ sessionSigner, authority });
@@ -453,12 +480,15 @@ const getNearbyTiles = async (runtime, positionAccount) => {
 const applySystem = async (runtime, player, systemId, entities, args) => {
     const { ApplySystem, Session } = await import("@magicblock-labs/bolt-sdk");
     const boltSessionToken = await deriveBoltSessionToken(runtime.agent.publicKey, player.session.owner);
-    const hasSession = await getAccount(runtime, boltSessionToken);
-    if (!hasSession) {
+    const sessionTokenState = await getBoltSessionTokenState(runtime, boltSessionToken);
+    if (!sessionTokenState.exists) {
         throw new Error(`Missing BOLT session token ${boltSessionToken.toBase58()} for owner ${player.session.owner.toBase58()}. Run open_wilds_prepare_session and grant it in the game UI.`);
     }
+    if (sessionTokenState.expired) {
+        throw new Error(`Expired BOLT session token ${boltSessionToken.toBase58()} for owner ${player.session.owner.toBase58()} (validUntilUnixSeconds=${sessionTokenState.validUntilUnixSeconds}). Run open_wilds_prepare_session and grant it in the game UI before live gameplay actions.`);
+    }
     const result = (await ApplySystem({
-        authority: player.session.owner,
+        authority: runtime.agent.publicKey,
         systemId,
         world: player.worldPda,
         entities,
