@@ -629,12 +629,10 @@ const ensureTileItemDelegated = async (
   runtime: Runtime,
   tileItem: Awaited<ReturnType<typeof getTileItemRefs>>
 ) => {
-  if (await isComponentVisibleOnEr(runtime, tileItem.component)) {
-    return;
-  }
-
   if (await isComponentDelegated(runtime, tileItem.component)) {
-    await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
+    if (!(await isComponentVisibleOnEr(runtime, tileItem.component))) {
+      await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
+    }
     return;
   }
 
@@ -667,6 +665,7 @@ const ensureTileItemDelegated = async (
     runtime.baseConnection
   );
   await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
 };
 
 const getPlayerComponents = async (runtime: Runtime, player: PlayerRefs) => ({

@@ -366,11 +366,10 @@ const ensureTileItemInitialized = async (runtime, tileItem, point, createIfMissi
     }
 };
 const ensureTileItemDelegated = async (runtime, tileItem) => {
-    if (await isComponentVisibleOnEr(runtime, tileItem.component)) {
-        return;
-    }
     if (await isComponentDelegated(runtime, tileItem.component)) {
-        await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
+        if (!(await isComponentVisibleOnEr(runtime, tileItem.component))) {
+            await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
+        }
         return;
     }
     const baseAccount = await runtime.baseConnection.getAccountInfo(tileItem.component);
@@ -388,6 +387,7 @@ const ensureTileItemDelegated = async (runtime, tileItem) => {
         }, 0, EPHEMERAL_ROLLUP_VALIDATOR, PROGRAMS.tileItem),
     }, runtime.baseConnection);
     await waitForComponentOnEr(runtime, tileItem.component, "Tile Item");
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
 };
 const getPlayerComponents = async (runtime, player) => ({
     playerOwner: await deriveComponent(runtime, player.entityPda, PROGRAMS.playerOwner),
